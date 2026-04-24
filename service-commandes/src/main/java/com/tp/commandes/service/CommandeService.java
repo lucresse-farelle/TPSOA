@@ -1,13 +1,14 @@
 package com.tp.commandes.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tp.commandes.model.*;
 import com.tp.commandes.repository.CommandeRepository;
+import com.tp.commandes.repository.OutboxEventRepository;
 import com.tp.events.CommandeAnnuleeEvent;
 import com.tp.events.CommandeCreeEvent;
 import com.tp.events.LigneCommande;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -20,20 +21,21 @@ import java.util.stream.Collectors;
 public class CommandeService {
 
     private static final Logger log = LoggerFactory.getLogger(CommandeService.class);
-    private static final String TOPIC = "commandes"; // Nom du topic Kafka
 
-    // KafkaTemplate = l'outil pour envoyer des messages dans Kafka
-    private final KafkaTemplate<String, Object> kafkaTemplate;
+    private final ObjectMapper objectMapper;
+    private final OutboxEventRepository outboxRepo;
     private final CommandeRepository repo;
 
     // Injection de dépendances : Spring fournit automatiquement ces objets
-    public CommandeService(KafkaTemplate<String, Object> kafkaTemplate,
+    public CommandeService(ObjectMapper objectMapper,
+                           OutboxEventRepository outboxRepo,
                            CommandeRepository repo) {
-        this.kafkaTemplate = kafkaTemplate;
+        this.objectMapper = objectMapper;
+        this.outboxRepo = outboxRepo;
         this.repo = repo;
     }
 
-    @Transactional // Assure que la sauvegarde DB et la publication Kafka sont groupées
+    @Transactional // Assure que la sauvegarde DB et l'insertion en outbox sont atomiques
     public Commande creerCommande(CommandeRequest req) {
         // 1. Calculer le montant total
         BigDecimal montant = req.getLignes().stream()
@@ -60,9 +62,7 @@ public class CommandeService {
                 })
                 .collect(Collectors.toList());
 
-        // 4. Publier l'événement dans Kafka (fire-and-forget)
-        // La clé = commandeId garantit que tous les événements d'une même commande
-        // arrivent dans la même partition, dans l'ordre
+        // 4. Créer l'événement et le sauvegarder dans l'outbox
         CommandeCreeEvent event = new CommandeCreeEvent(
                 sauvegardee.getId(),
                 req.getClientId(),
@@ -71,16 +71,15 @@ public class CommandeService {
                 lignesEvent
         );
 
-        kafkaTemplate.send(TOPIC, sauvegardee.getId(), event)
-                .whenComplete((result, ex) -> {
-                    if (ex != null) {
-                        log.error("[COMMANDES] Erreur publication Kafka pour commande {}", sauvegardee.getId(), ex);
-                    } else {
-                        log.info("[COMMANDES] Événement publié — commande {} dans partition {}",
-                                sauvegardee.getId(),
-                                result.getRecordMetadata().partition());
-                    }
-                });
+        try {
+            String payload = objectMapper.writeValueAsString(event);
+            OutboxEvent outboxEvent = new OutboxEvent(sauvegardee.getId(), "CommandeCreeEvent", payload);
+            outboxRepo.save(outboxEvent);
+            log.info("[COMMANDES] Événement CommandeCreeEvent sauvegardé en outbox pour commande {}", sauvegardee.getId());
+        } catch (Exception e) {
+            log.error("[COMMANDES] Erreur sérialisation événement pour commande {}", sauvegardee.getId(), e);
+            throw new RuntimeException("Erreur lors de la sauvegarde de l'événement", e);
+        }
 
         return sauvegardee;
     }
@@ -93,11 +92,18 @@ public class CommandeService {
         cmd.setStatut(StatutCommande.ANNULEE);
         repo.save(cmd);
 
-        // Reconstituer les lignes (simplification TP : on publie sans lignes détaillées)
+        // Créer l'événement et le sauvegarder dans l'outbox
         CommandeAnnuleeEvent event = new CommandeAnnuleeEvent(commandeId, List.of(), motif);
-        kafkaTemplate.send(TOPIC, commandeId, event);
+        try {
+            String payload = objectMapper.writeValueAsString(event);
+            OutboxEvent outboxEvent = new OutboxEvent(commandeId, "CommandeAnnuleeEvent", payload);
+            outboxRepo.save(outboxEvent);
+            log.info("[COMMANDES] Événement CommandeAnnuleeEvent sauvegardé en outbox pour commande {}", commandeId);
+        } catch (Exception e) {
+            log.error("[COMMANDES] Erreur sérialisation événement pour commande {}", commandeId, e);
+            throw new RuntimeException("Erreur lors de la sauvegarde de l'événement", e);
+        }
 
-        log.info("[COMMANDES] Commande {} annulée, événement publié", commandeId);
         return cmd;
     }
 }
