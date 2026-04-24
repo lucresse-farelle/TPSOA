@@ -177,4 +177,7 @@ mvn spring-boot:run
 - Monitoring avec Prometheus/Grafana
 - Sécurité avec OAuth2/JWT
 
+## Lien vers le Dépôt Git
+https://github.com/lucresse-farelle/TPSOA.git
+
 Cette documentation couvre tous les aspects du TP. Assurez-vous de comprendre chaque section avant la présentation !
